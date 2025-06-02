@@ -1,0 +1,180 @@
+import os
+import time
+from telegram import Update
+from telegram.ext import (
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    ConversationHandler,
+    filters
+)
+from github import Github
+from jinja2 import Environment, FileSystemLoader
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Conversation states
+(
+    TITLE, CONTRACT, DESCRIPTION,
+    BG_COLOR, FONT_COLOR,
+    DOMAIN, TELEGRAM, TWITTER, IMAGE
+) = range(9)
+
+# Initialize GitHub
+github = Github(os.getenv("GITHUB_TOKEN"))
+github_username = os.getenv("GITHUB_USERNAME")
+
+# Template setup
+env = Environment(loader=FileSystemLoader("templates"))
+template = env.get_template("website_template.html")
+
+async def launch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Enter project title:")
+    return TITLE
+
+async def title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['title'] = update.message.text
+    await update.message.reply_text("Enter contract address:")
+    return CONTRACT
+
+async def contract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['contract_address'] = update.message.text
+    await update.message.reply_text("Enter description:")
+    return DESCRIPTION
+
+async def description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['description'] = update.message.text
+    await update.message.reply_text("Enter background color (#RRGGBB or name):")
+    return BG_COLOR
+
+async def bg_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['bg_color'] = update.message.text or "#ffffff"
+    await update.message.reply_text("Enter font color (#RRGGBB or name):")
+    return FONT_COLOR
+
+async def font_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['font_color'] = update.message.text or "#000000"
+    await update.message.reply_text("Custom domain? (or /skip)")
+    return DOMAIN
+
+async def skip_domain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['domain'] = None
+    await update.message.reply_text("Telegram link? (or /skip)")
+    return TELEGRAM
+
+async def domain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['domain'] = update.message.text
+    await update.message.reply_text("Telegram link? (or /skip)")
+    return TELEGRAM
+
+async def skip_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['telegram_link'] = None
+    await update.message.reply_text("Twitter link? (or /skip)")
+    return TWITTER
+
+async def telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['telegram_link'] = update.message.text
+    await update.message.reply_text("Twitter link? (or /skip)")
+    return TWITTER
+
+async def skip_twitter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['twitter_link'] = None
+    await update.message.reply_text("Upload image (or /skip)")
+    return IMAGE
+
+async def twitter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['twitter_link'] = update.message.text
+    await update.message.reply_text("Upload image (or /skip)")
+    return IMAGE
+
+async def skip_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['image_filename'] = None
+    return await deploy(update, context)
+
+async def image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    photo = await update.message.photo[-1].get_file()
+    context.user_data['image_filename'] = f"image_{int(time.time())}.jpg"
+    context.user_data['image_bytes'] = await photo.download_as_bytearray()
+    return await deploy(update, context)
+
+async def deploy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        data = {
+            'title': context.user_data['title'],
+            'bg_color': context.user_data['bg_color'],
+            'font_color': context.user_data['font_color'],
+            'contract_address': context.user_data['contract_address'],
+            'description': context.user_data['description'],
+            'telegram_link': context.user_data.get('telegram_link'),
+            'twitter_link': context.user_data.get('twitter_link'),
+            'image_filename': context.user_data.get('image_filename'),
+            'is_premium': context.user_data.get('is_premium', False)  # Add premium flag
+        }
+
+        html = template.render(**data)
+        repo_name = f"{data['title'].lower().replace(' ', '-')}"
+        repo = github.get_user().create_repo(repo_name)
+
+        repo.create_file("index.html", "Initial commit", html)
+        repo.create_file(".nojekyll", "Disable Jekyll", "")
+
+        if data['image_filename'] and 'image_bytes' in context.user_data:
+            repo.create_file(
+                path=data['image_filename'],
+                message="Add project image",
+                content=bytes(context.user_data['image_bytes']),
+                branch="main"
+            )
+
+        repo._requester.requestJsonAndCheck(
+            "POST",
+            repo.url + "/pages",
+            input={"source": {"branch": "main", "path": "/"}}
+        )
+
+        await update.message.reply_text(
+            f"✅ Website deployed!\n"
+            f"🔗 https://{github_username}.github.io/{repo_name}\n"
+            f"Please allow 1-2 minutes for the image to appear."
+        )
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("❌ Cancelled")
+    return ConversationHandler.END
+
+def get_conv_handler():
+    """Returns the configured ConversationHandler"""
+    return ConversationHandler(
+        entry_points=[CommandHandler('launch', launch)],
+        states={
+            TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, title)],
+            CONTRACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, contract)],
+            DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, description)],
+            BG_COLOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, bg_color)],
+            FONT_COLOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, font_color)],
+            DOMAIN: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, domain),
+                CommandHandler('skip', skip_domain)
+            ],
+            TELEGRAM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, telegram),
+                CommandHandler('skip', skip_telegram)
+            ],
+            TWITTER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, twitter),
+                CommandHandler('skip', skip_twitter)
+            ],
+            IMAGE: [
+                MessageHandler(filters.PHOTO, image),
+                CommandHandler('skip', skip_image)
+            ],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    )
